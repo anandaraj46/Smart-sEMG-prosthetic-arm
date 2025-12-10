@@ -1,2 +1,2 @@
-# Robot Arm Project
+# Prosthetic Arm Project
 Initial skeleton.
