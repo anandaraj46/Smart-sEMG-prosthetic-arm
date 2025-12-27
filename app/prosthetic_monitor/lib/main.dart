@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'services/mqtt_service.dart';
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 void main() {
   runApp(const GripMateApp());
@@ -10,6 +12,7 @@ class GripMateApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: navigatorKey,
       title: 'GripMate Prosthetic Monitor',
       theme: ThemeData(
         primarySwatch: Colors.blue,
@@ -64,6 +67,15 @@ class HomeScreen extends StatelessWidget {
               icon: Icons.security,
               page: const SafetyAlertsScreen(),
             ),
+            const SizedBox(height: 16),
+
+            _buildNavigationButton(
+              context: context,
+              title: 'Prosthetic Control',
+              icon: Icons.pan_tool,
+              page: const ProstheticControlScreen(),
+            ),
+
           ],
         ),
       ),
@@ -503,6 +515,138 @@ class SafetyAlertsScreen extends StatelessWidget {
             activeColor: Colors.blue,
           ),
         ],
+      ),
+    );
+  }
+}
+class ProstheticControlScreen extends StatefulWidget {
+  const ProstheticControlScreen({super.key});
+
+  @override
+  State<ProstheticControlScreen> createState() =>
+      _ProstheticControlScreenState();
+}
+
+class _ProstheticControlScreenState extends State<ProstheticControlScreen> {
+  final MqttService mqtt = MqttService();
+  bool isConnected = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _connectMqtt();
+  }
+
+  Future<void> _connectMqtt() async {
+    try {
+      await mqtt.connect();
+      setState(() {
+        isConnected = true;
+      });
+    } catch (e) {
+      debugPrint('MQTT connection failed: $e');
+    }
+  }
+
+  Widget controlCard({
+    required String title,
+    required String description,
+    required int command,
+    required IconData icon,
+    required Color color,
+  }) {
+    return Card(
+      elevation: 4,
+      margin: const EdgeInsets.symmetric(vertical: 10),
+      child: ListTile(
+        leading: CircleAvatar(
+          backgroundColor: color.withOpacity(0.2),
+          child: Icon(icon, color: color),
+        ),
+        title: Text(
+          title,
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+        subtitle: Text(description),
+        trailing: Text(
+          command.toString(),
+          style: TextStyle(
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+            color: color,
+          ),
+        ),
+        onTap: () {
+          if (!isConnected) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('MQTT not connected'),
+              ),
+            );
+            return;
+          }
+
+          mqtt.sendCommand(command);
+
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Command $command sent')),
+          );
+        },
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Prosthetic Control'),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.pop(context),
+        ),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Motor Control Mapping',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'Tap an action to send its command value',
+              style: TextStyle(color: Colors.grey),
+            ),
+            const SizedBox(height: 20),
+
+            controlCard(
+              title: 'Close Fingers',
+              description: 'All finger motors rotate to close the hand',
+              command: 1,
+              icon: Icons.front_hand,
+              color: Colors.red,
+            ),
+
+            controlCard(
+              title: 'Open Fingers',
+              description: 'All finger motors rotate to open the hand',
+              command: 2,
+              icon: Icons.pan_tool_alt,
+              color: Colors.green,
+            ),
+
+            controlCard(
+              title: 'Move Wrist',
+              description: 'Wrist motor moves forward / backward',
+              command: 3,
+              icon: Icons.rotate_right,
+              color: Colors.blue,
+            ),
+          ],
+        ),
       ),
     );
   }
