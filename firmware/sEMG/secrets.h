@@ -1,8 +1,8 @@
 #pragma once
 
 // -------- WiFi Credentials --------
-#define WIFI_SSID "GNXS-3F6790"
-#define WIFI_PASSWORD "chacko1186"
+#define WIFI_SSID "one_plus"
+#define WIFI_PASSWORD "moluzZ@2616"
 
 // -------- MQTT Configuration --------
 #define MQTT_BROKER "broker.hivemq.com"

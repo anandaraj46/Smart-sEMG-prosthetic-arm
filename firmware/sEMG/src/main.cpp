@@ -61,7 +61,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       theta[5] = (theta[5] == 0) ? 45 : -45;
       Serial.println("CMD 3: Wrist toggle");
       break;
-
     default:
       Serial.println("Unknown command");
       break;
