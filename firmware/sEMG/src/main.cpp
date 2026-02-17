@@ -1,93 +1,65 @@
 #include <Arduino.h>
-
 #include <ESP32Servo.h>
 
-#define NUM_SERVOS 7
+// --- PINS ---
+const int emgPin = 34;   // sEMG input
+const int servoPin = 18; // Servo PWM output
 
-int angleOffset(int i);
+Servo handServo;
 
+// --- EMG VARIABLES ---
+const int BASELINE = 1850; 
+const float EMA_ALPHA = 0.1;
+float smoothedEMG = 0;
 
-// ---------------- PIN ASSIGNMENT ----------------
-int servoPins[NUM_SERVOS] = {
-  13, // Finger 1
-  12, // Finger 2
-  14, // Finger 3
-  27, // Finger 4
-  26, // Finger 5
-  25, // Wrist
-  33  // Elbow
-};
+// --- HYSTERESIS THRESHOLDS ---
+const int FLEX_THRESHOLD = 650; 
+const int RELAX_THRESHOLD = 250; 
 
-// ---------------- LIMITS ----------------
-int minAngle[NUM_SERVOS] = {
-  0, 0, 0, 0, 0,   // Fingers
-  -45,             // Wrist
-  0                // Elbow
-};
-
-int maxAngle[NUM_SERVOS] = {
-  90, 90, 90, 90, 90, // Fingers
-  45,                 // Wrist
-  120                 // Elbow
-};
-
-// ---------------- OBJECTS ----------------
-Servo servos[NUM_SERVOS];
-int theta[NUM_SERVOS];   // control vector
-
-// ------------------------------------------------
+// --- DEFAULT SERVO ANGLES ---
+// Tweak these if the motor hums/buzzes at the limits!
+const int OPEN_ANGLE = 10;   // Safe resting angle 
+const int CLOSE_ANGLE = 170; // Safe flex angle 
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 Prosthetic Servo Controller Ready");
-
-  // Attach servos
-  for (int i = 0; i < NUM_SERVOS; i++) {
-    servos[i].attach(servoPins[i]);
-    theta[i] = 0;              // initialize position
-    servos[i].write(90);       // neutral position for safety
-  }
-
-  Serial.println("Enter: <joint_index> <angle>");
-  Serial.println("Example: 2 45");
+  analogReadResolution(12);
+  
+  // ESP32 Servo Timer Allocation
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  handServo.setPeriodHertz(50); // Standard 50Hz servo
+  handServo.attach(servoPin, 500, 2400); 
+  
+  handServo.write(OPEN_ANGLE); // Start with hand open
+  
+  Serial.println("\n--- SYSTEM ONLINE. MUSCLE CONTROL ENGAGED ---");
 }
 
 void loop() {
-  // -------- INPUT (Manual / ML later) --------
-  if (Serial.available()) {
-
-    int joint = Serial.parseInt();
-    int angle = Serial.parseInt();
-
-    if (joint >= 0 && joint < NUM_SERVOS) {
-
-      angle = constrain(angle, minAngle[joint], maxAngle[joint]);
-      theta[joint] = angle;
-
-      Serial.print("Joint ");
-      Serial.print(joint);
-      Serial.print(" set to ");
-      Serial.println(angle);
-
-    } else {
-      Serial.println("Invalid joint index!");
-    }
-
-    // clear buffer
-    while (Serial.available()) Serial.read();
+  int rawValue = analogRead(emgPin);
+  
+  // 1. Rectify (Absolute difference from baseline)
+  int rectifiedValue = abs(rawValue - BASELINE); 
+  
+  // 2. Smooth (Extract the envelope)
+  smoothedEMG = (EMA_ALPHA * rectifiedValue) + ((1 - EMA_ALPHA) * smoothedEMG);
+  
+  // 3. Teleplot Telemetry
+  Serial.printf(">Rectified:%d\n", rectifiedValue);
+  Serial.printf(">Smoothed:%.2f\n", smoothedEMG);
+  
+  // 4. Actuation Logic (The State Machine)
+  if (smoothedEMG > FLEX_THRESHOLD) {
+    handServo.write(CLOSE_ANGLE); 
+    Serial.println(">HandState:1"); // Graph the physical hand state on Teleplot
+  } else if (smoothedEMG < RELAX_THRESHOLD) {
+    handServo.write(OPEN_ANGLE);   
+    Serial.println(">HandState:0"); 
   }
-
-  // -------- SERVO ACTIVATION LOGIC --------
-  for (int i = 0; i < NUM_SERVOS; i++) {
-    servos[i].write(theta[i] + angleOffset(i));
-  }
-
-  delay(20); // 50 Hz update (servo-friendly)
-}
-
-// ---------------- OFFSET HANDLING ----------------
-// Some servos expect 0–180 only
-int angleOffset(int i) {
-  if (i == 5) return 90; // Wrist: map -45..45 → 45..135
-  return 0;
+  
+  delay(10); // Maintain ~100Hz control loop
 }
