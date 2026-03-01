@@ -7,8 +7,7 @@
 //  PINS
 // ===================================================
 #define EMG_PIN    34
-#define FSR_PIN    35
-#define SERVO_PIN  25
+const int SERVO_PINS[5] = {18, 19, 23, 25, 26}; // Your 5 servo pins
 
 // ===================================================
 //  SERVO
@@ -16,13 +15,6 @@
 #define SERVO_OPEN       0
 #define SERVO_CLOSED     130
 #define SERVO_STEP_MS    12
-
-// ===================================================
-//  FSR THRESHOLDS
-// ===================================================
-#define FSR_CONTACT      200
-#define FSR_MAX          3000
-#define FSR_SLIP_MARGIN  10
 
 // ===================================================
 //  EMG
@@ -37,7 +29,6 @@
 // ===================================================
 #define CONFIRM_MS       300
 #define RELEASE_MS       400
-#define FSR_CHECK_MS     50
 
 // ===================================================
 //  SIGNAL PROCESSING
@@ -72,31 +63,29 @@ unsigned long muscleOnTime  = 0;
 unsigned long muscleOffTime = 0;
 
 // ===================================================
-//  FSR
-// ===================================================
-int fsrRaw      = 0;
-int fsrSmoothed = 0;
-int fsrBuf[8]   = {0};
-int fsrBufIdx   = 0;
-
-// ===================================================
 //  HAND STATE MACHINE
 // ===================================================
 enum HandState { IDLE, CLOSING, HOLDING, OPENING };
 HandState handState = IDLE;
 
 int  servoAngle     = SERVO_OPEN;
-int  holdAngle      = SERVO_OPEN;
-bool objectHeld     = false;
 unsigned long stepTimer     = 0;
-unsigned long fsrCheckTimer = 0;
 
 // ===================================================
 //  TELEPLOT
 // ===================================================
 unsigned long plotTimer = 0;
 
-Servo grip;
+Servo fingers[5];
+
+// ===================================================
+//  HELPER: MOVE ALL SERVOS
+// ===================================================
+void moveAllFingers(int angle) {
+  for (int i = 0; i < 5; i++) {
+    fingers[i].write(angle);
+  }
+}
 
 // ===================================================
 //  ISR
@@ -143,18 +132,6 @@ void processEMG(int adc) {
 }
 
 // ===================================================
-//  FSR READ
-// ===================================================
-void readFSR() {
-  fsrBuf[fsrBufIdx] = analogRead(FSR_PIN);
-  fsrBufIdx = (fsrBufIdx + 1) % 8;
-  long sum = 0;
-  for (int i = 0; i < 8; i++) sum += fsrBuf[i];
-  fsrRaw      = fsrBuf[(fsrBufIdx - 1 + 8) % 8];
-  fsrSmoothed = (int)(sum / 8);
-}
-
-// ===================================================
 //  MUSCLE DEBOUNCE
 // ===================================================
 void updateMuscle() {
@@ -175,7 +152,6 @@ void updateHand() {
   switch (handState) {
 
     case IDLE:
-      objectHeld = false;
       if (muscleActive) {
         handState = CLOSING;
         stepTimer = now;
@@ -192,25 +168,12 @@ void updateHand() {
       }
       if (now - stepTimer >= SERVO_STEP_MS) {
         stepTimer = now;
-        readFSR();
 
-        if (fsrSmoothed >= FSR_CONTACT) {
-          holdAngle     = servoAngle;
-          objectHeld    = true;
-          handState     = HOLDING;
-          fsrCheckTimer = now;
-          Serial.printf(">> CLOSING -> HOLDING at %d deg | FSR:%d\n",
-                        holdAngle, fsrSmoothed);
-          break;
-        }
         if (servoAngle < SERVO_CLOSED) {
           servoAngle++;
-          grip.write(servoAngle);
+          moveAllFingers(servoAngle);
         } else {
-          holdAngle     = SERVO_CLOSED;
-          objectHeld    = false;
-          handState     = HOLDING;
-          fsrCheckTimer = now;
+          handState = HOLDING;
           Serial.println(">> CLOSING -> HOLDING (fully closed)");
         }
       }
@@ -223,25 +186,7 @@ void updateHand() {
         Serial.println(">> HOLDING -> OPENING");
         break;
       }
-      if (now - fsrCheckTimer >= FSR_CHECK_MS) {
-        fsrCheckTimer = now;
-        readFSR();
-
-        if (objectHeld && fsrSmoothed < FSR_CONTACT) {
-          if (servoAngle < holdAngle + FSR_SLIP_MARGIN) {
-            servoAngle++;
-            grip.write(servoAngle);
-            Serial.println(">> SLIP - tightening");
-          }
-        }
-        if (fsrSmoothed >= FSR_MAX) {
-          if (servoAngle > SERVO_OPEN) {
-            servoAngle--;
-            grip.write(servoAngle);
-            Serial.println(">> OVER-PRESSURE - backing off");
-          }
-        }
-      }
+      // Just hold the angle until the muscle relaxes
       break;
 
     case OPENING:
@@ -249,10 +194,9 @@ void updateHand() {
         stepTimer = now;
         if (servoAngle > SERVO_OPEN) {
           servoAngle--;
-          grip.write(servoAngle);
+          moveAllFingers(servoAngle);
         } else {
           servoAngle = SERVO_OPEN;
-          objectHeld = false;
           handState  = IDLE;
           Serial.println(">> OPENING -> IDLE");
         }
@@ -273,11 +217,17 @@ void setup() {
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
-  // Servo
+  // Servos
   ESP32PWM::allocateTimer(0);
-  grip.setPeriodHertz(50);
-  grip.attach(SERVO_PIN, 500, 2400);
-  grip.write(SERVO_OPEN);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  for (int i = 0; i < 5; i++) {
+    fingers[i].setPeriodHertz(50);
+    fingers[i].attach(SERVO_PINS[i], 500, 2400);
+    fingers[i].write(SERVO_OPEN);
+  }
   servoAngle = SERVO_OPEN;
 
   // Clean muscle state
@@ -294,12 +244,11 @@ void setup() {
   timerAlarmEnable(emgTimer);
 
   Serial.println("=====================================");
-  Serial.println("  ADAPTIVE GRIP — ESP32              ");
+  Serial.println("  5-SERVO GRIP — ESP32               ");
   Serial.println("=====================================");
   Serial.printf ("  Threshold : %.4f\n", threshold);
-  Serial.printf ("  FSR contact: %d\n",  FSR_CONTACT);
   Serial.printf ("  Servo range: %d to %d deg\n", SERVO_OPEN, SERVO_CLOSED);
-  Serial.println("  c=recalibrate  o=force open  t=values");
+  Serial.println("  o = force open  t=values");
   Serial.println("=====================================\n");
   Serial.println("  Ready! Flex to close, relax to open.");
 }
@@ -330,12 +279,11 @@ void loop() {
     char cmd = Serial.read();
     if (cmd == 'o') {
       handState  = OPENING;
-      objectHeld = false;
       Serial.println(">> Force open");
     }
     if (cmd == 't') {
-      Serial.printf("RMS:%.4f  Thresh:%.4f  Muscle:%d  FSR:%d  Angle:%d  State:%d\n",
-                    rmsValue, threshold, muscleActive, fsrSmoothed,
+      Serial.printf("RMS:%.4f  Thresh:%.4f  Muscle:%d  Angle:%d  State:%d\n",
+                    rmsValue, threshold, muscleActive,
                     servoAngle, (int)handState);
     }
     // Manual threshold tuning
@@ -349,8 +297,6 @@ void loop() {
     Serial.printf(">rms:%.4f\n",       rmsValue);
     Serial.printf(">threshold:%.4f\n", threshold);
     Serial.printf(">muscle:%.1f\n",    muscleActive ? 1.0f : 0.0f);
-    Serial.printf(">fsrRaw:%.1f\n",    (float)fsrRaw);
-    Serial.printf(">fsrSmooth:%.1f\n", (float)fsrSmoothed);
     Serial.printf(">angle:%.1f\n",     (float)servoAngle);
     Serial.printf(">state:%.1f\n",     (float)handState);
   }
