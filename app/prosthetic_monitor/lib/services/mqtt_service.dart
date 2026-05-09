@@ -1,25 +1,61 @@
 import 'package:mqtt_client/mqtt_client.dart';
-import 'package:mqtt_client/mqtt_server_client.dart';
+    }
 
-class MqttService {
-  final client = MqttServerClient('broker.hivemq.com', 'flutter_gripmate');
+    //////////////////////////////////////////////////////////
+    // SUBSCRIBE TOPICS
+    //////////////////////////////////////////////////////////
 
-  Future<void> connect() async {
-    client.port = 1883;
-    client.keepAlivePeriod = 20;
-    client.logging(on: false);
+    client.subscribe(
+      'gripmate/emg',
+      MqttQos.atLeastOnce,
+    );
 
-    await client.connect();
+    client.subscribe(
+      'gripmate/fsr',
+      MqttQos.atLeastOnce,
+    );
+
+    client.subscribe(
+      'gripmate/gesture',
+      MqttQos.atLeastOnce,
+    );
+
+    //////////////////////////////////////////////////////////
+    // LISTENER
+    //////////////////////////////////////////////////////////
+
+    client.updates!.listen((messages) {
+
+      final recMess =
+          messages[0].payload as MqttPublishMessage;
+
+      final payload =
+          MqttPublishPayload.bytesToStringAsString(
+              recMess.payload.message);
+
+      final topic = messages[0].topic;
+
+      print('TOPIC: $topic');
+      print('PAYLOAD: $payload');
+    });
   }
 
-  void sendCommand(int command) {
+  //////////////////////////////////////////////////////////
+  // SEND COMMANDS
+  //////////////////////////////////////////////////////////
+
+  void sendCommand(String command) {
+
     final builder = MqttClientPayloadBuilder();
-    builder.addString(command.toString());
+
+    builder.addString(command);
 
     client.publishMessage(
-      'gripmate/control',
-      MqttQos.atMostOnce,
+      'gripmate/command',
+      MqttQos.atLeastOnce,
       builder.payload!,
     );
+
+    print("Sent: $command");
   }
 }
