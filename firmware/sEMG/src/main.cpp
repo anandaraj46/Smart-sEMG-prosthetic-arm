@@ -1,303 +1,382 @@
-#include "soc/rtc_cntl_reg.h"
 #include <Arduino.h>
 #include <ESP32Servo.h>
-#include <math.h>
+#include <Wire.h>
+#include "Adafruit_DRV2605.h"
 
-// ===================================================
-//  PINS
-// ===================================================
-#define EMG_PIN    34
-const int SERVO_PINS[5] = {18, 19, 23, 25, 26}; // Your 5 servo pins
+// ======================================================
+// CONFIGURATION
+// ======================================================
+#define NUM_FINGERS 5
 
-// ===================================================
-//  SERVO
-// ===================================================
-#define SERVO_OPEN       0
-#define SERVO_CLOSED     130
-#define SERVO_STEP_MS    12
+// ======================================================
+// PINS - SENSORS
+// ======================================================
+const int emgPin1 = 35;   // Flexor muscle
+const int emgPin2 = 34;   // Extensor muscle
+const int fsrPin  = 33;   // Force sensitive resistor
 
-// ===================================================
-//  EMG
-// ===================================================
-#define VREF             3.3f
-#define ADC_MAX          4095.0f
-#define MIDPOINT         1.65f
-#define WINDOW_SIZE      200
+// ======================================================
+// PINS - SERVOS
+// ======================================================
+const int servoPins[NUM_FINGERS] = {18, 19, 23, 26, 27};
 
-// ===================================================
-//  TIMING
-// ===================================================
-#define CONFIRM_MS       300
-#define RELEASE_MS       400
+// ======================================================
+// SERVO OBJECTS (Array-based)
+// ======================================================
+Servo servos[NUM_FINGERS];
 
-// ===================================================
-//  SIGNAL PROCESSING
-// ===================================================
-hw_timer_t   *emgTimer = NULL;
-portMUX_TYPE  timerMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool newSample = false;
-volatile int  rawADC    = 0;
+// ======================================================
+// DRV2605L HAPTIC DRIVER
+// ======================================================
+Adafruit_DRV2605 drv;
 
-float rmsBuffer[WINDOW_SIZE] = {0};
-int   rmsIndex  = 0;
-float rmsValue  = 0;
-float hp_in     = 0, hp_out = 0;
-float lp_state  = 0;
+// ======================================================
+// EMG SIGNAL PROCESSING
+// ======================================================
+const int BASELINE = 1850;              // EMG baseline (mid-point of ADC range)
+const float EMA_ALPHA = 0.10f;          // Exponential moving average smoothing factor
 
-// ===================================================
-//  CALIBRATION — hardcoded from your session data
-// ===================================================
-float restMean  = 0.025f;
-float restStd   = 0.008f;
-float actMean   = 0.380f;
-float threshold = 0.055f;
-bool  calibDone = true;
-int   calibPhase = 3;
+float smoothedEMG1 = 0;                 // Smoothed flexor signal
+float smoothedEMG2 = 0;                 // Smoothed extensor signal
 
-// ===================================================
-//  MUSCLE STATE
-// ===================================================
-bool muscleActive = false;
-bool musclePrev   = false;
-unsigned long muscleOnTime  = 0;
-unsigned long muscleOffTime = 0;
+// ======================================================
+// EMG THRESHOLDS
+// ======================================================
+const int FLEX_THRESHOLD   = 650;       // Threshold to trigger close gesture
+const int POINT_THRESHOLD  = 850;       // Threshold to trigger point gesture
+const int RELAX_THRESHOLD  = 250;       // Threshold to trigger open gesture
 
-// ===================================================
-//  HAND STATE MACHINE
-// ===================================================
-enum HandState { IDLE, CLOSING, HOLDING, OPENING };
-HandState handState = IDLE;
+// ======================================================
+// SERVO ANGLE LIMITS
+// ======================================================
+const int OPEN_ANGLE   = 10;            // Fully open finger angle
+const int CLOSE_MIN    = 40;            // Minimum close angle
+const int CLOSE_MAX    = 170;           // Maximum close angle
 
-int  servoAngle     = SERVO_OPEN;
-unsigned long stepTimer     = 0;
+// ======================================================
+// POINT GESTURE POSITIONS (per finger)
+// ======================================================
+const int POINT_POS[NUM_FINGERS] = {
+  50,    // Thumb: partially closed
+  10,    // Index: fully open (pointing)
+  170,   // Middle: fully closed
+  170,   // Ring: fully closed
+  170    // Pinky: fully closed
+};
 
-// ===================================================
-//  TELEPLOT
-// ===================================================
-unsigned long plotTimer = 0;
+// ======================================================
+// FSR (FORCE SENSOR) PARAMETERS
+// ======================================================
+const int FSR_CONTACT      = 180;       // Minimum FSR value to detect object contact
+const int FSR_SLIP_THRESH  = 150;       // FSR drop threshold to trigger slip detection
+const int FSR_MAX          = 3200;      // Maximum safe FSR value (overpressure limit)
 
-Servo fingers[5];
+// ======================================================
+// GESTURE ENUM
+// ======================================================
+enum Gesture {
+  GESTURE_OPEN,
+  GESTURE_CLOSE,
+  GESTURE_POINT
+};
 
-// ===================================================
-//  HELPER: MOVE ALL SERVOS
-// ===================================================
-void moveAllFingers(int angle) {
-  for (int i = 0; i < 5; i++) {
-    fingers[i].write(angle);
+Gesture currentGesture = GESTURE_OPEN;
+
+// ======================================================
+// SERVO POSITION STATE
+// ======================================================
+int currentPos[NUM_FINGERS] = {
+  OPEN_ANGLE, OPEN_ANGLE, OPEN_ANGLE, OPEN_ANGLE, OPEN_ANGLE
+};
+
+int targetPos[NUM_FINGERS] = {
+  OPEN_ANGLE, OPEN_ANGLE, OPEN_ANGLE, OPEN_ANGLE, OPEN_ANGLE
+};
+
+// ======================================================
+// FSR STATE
+// ======================================================
+int fsrValue = 0;
+bool objectDetected = false;
+int previousFSR = 0;
+
+// ======================================================
+// TIMERS
+// ======================================================
+unsigned long servoTimer = 0;
+const int SERVO_UPDATE_INTERVAL = 8;   // milliseconds between servo updates
+
+// ======================================================
+// HAPTIC FEEDBACK FUNCTIONS
+// ======================================================
+
+// Real-time vibration based on force feedback
+void vibrateRealtime(int strength) {
+  strength = constrain(strength, 0, 127);
+  drv.setRealtimeValue(strength);
+}
+
+// Haptic feedback: object touch
+void hapticTouch() {
+  drv.setWaveform(0, 47);  // Effect 47: touch
+  drv.setWaveform(1, 0);   // Stop
+  drv.go();
+}
+
+// Haptic feedback: slip detected
+void hapticSlip() {
+  drv.setWaveform(0, 12);  // Effect 12: slip warning
+  drv.setWaveform(1, 0);
+  drv.go();
+}
+
+// Haptic feedback: overpressure
+void hapticOverpressure() {
+  drv.setWaveform(0, 84);  // Effect 84: strong hit
+  drv.setWaveform(1, 0);
+  drv.go();
+}
+
+// Haptic feedback: point gesture initiated
+void hapticPoint() {
+  drv.setWaveform(0, 10);  // Effect 10: light pulse
+  drv.setWaveform(1, 0);
+  drv.go();
+}
+
+// ======================================================
+// SERVO CONTROL FUNCTIONS
+// ======================================================
+
+// Set target angle for all fingers
+void setAllTargets(int angle) {
+  for (int i = 0; i < NUM_FINGERS; i++) {
+    targetPos[i] = angle;
   }
 }
 
-// ===================================================
-//  ISR
-// ===================================================
-void IRAM_ATTR onTimer() {
-  portENTER_CRITICAL_ISR(&timerMux);
-  rawADC    = analogRead(EMG_PIN);
-  newSample = true;
-  portEXIT_CRITICAL_ISR(&timerMux);
-}
-
-// ===================================================
-//  FILTERS
-// ===================================================
-float highPass(float in) {
-  const float a = 0.9747f;
-  float out = a * (hp_out + in - hp_in);
-  hp_in  = in;
-  hp_out = out;
-  return out;
-}
-float lowPass(float in) {
-  const float a = 0.7f;
-  lp_state = a * lp_state + (1.0f - a) * in;
-  return lp_state;
-}
-float computeRMS() {
-  float sum = 0;
-  for (int i = 0; i < WINDOW_SIZE; i++)
-    sum += rmsBuffer[i] * rmsBuffer[i];
-  return sqrtf(sum / WINDOW_SIZE);
-}
-
-// ===================================================
-//  PROCESS EMG
-// ===================================================
-void processEMG(int adc) {
-  float v  = (adc / ADC_MAX) * VREF - MIDPOINT;
-  float hp = highPass(v);
-  float lp = lowPass(hp);
-  rmsBuffer[rmsIndex] = lp;
-  rmsIndex = (rmsIndex + 1) % WINDOW_SIZE;
-  rmsValue = computeRMS();
-}
-
-// ===================================================
-//  MUSCLE DEBOUNCE
-// ===================================================
-void updateMuscle() {
-  bool raw = (rmsValue > threshold);
-  if ( raw && !musclePrev) muscleOnTime  = millis();
-  if (!raw &&  musclePrev) muscleOffTime = millis();
-  if ( raw && millis() - muscleOnTime  >= CONFIRM_MS) muscleActive = true;
-  if (!raw && millis() - muscleOffTime >= RELEASE_MS)  muscleActive = false;
-  musclePrev = raw;
-}
-
-// ===================================================
-//  HAND STATE MACHINE
-// ===================================================
-void updateHand() {
-  unsigned long now = millis();
-
-  switch (handState) {
-
-    case IDLE:
-      if (muscleActive) {
-        handState = CLOSING;
-        stepTimer = now;
-        Serial.println(">> IDLE -> CLOSING");
-      }
-      break;
-
-    case CLOSING:
-      if (!muscleActive) {
-        handState = OPENING;
-        stepTimer = now;
-        Serial.println(">> CLOSING -> OPENING");
-        break;
-      }
-      if (now - stepTimer >= SERVO_STEP_MS) {
-        stepTimer = now;
-
-        if (servoAngle < SERVO_CLOSED) {
-          servoAngle++;
-          moveAllFingers(servoAngle);
-        } else {
-          handState = HOLDING;
-          Serial.println(">> CLOSING -> HOLDING (fully closed)");
-        }
-      }
-      break;
-
-    case HOLDING:
-      if (!muscleActive) {
-        handState = OPENING;
-        stepTimer = now;
-        Serial.println(">> HOLDING -> OPENING");
-        break;
-      }
-      // Just hold the angle until the muscle relaxes
-      break;
-
-    case OPENING:
-      if (now - stepTimer >= SERVO_STEP_MS) {
-        stepTimer = now;
-        if (servoAngle > SERVO_OPEN) {
-          servoAngle--;
-          moveAllFingers(servoAngle);
-        } else {
-          servoAngle = SERVO_OPEN;
-          handState  = IDLE;
-          Serial.println(">> OPENING -> IDLE");
-        }
-      }
-      break;
+// Set target angles for point gesture
+void setPointTargets() {
+  for (int i = 0; i < NUM_FINGERS; i++) {
+    targetPos[i] = POINT_POS[i];
   }
 }
 
-// ===================================================
-//  SETUP
-// ===================================================
+// Smoothly update servo positions (1 degree per interval)
+void updateServos() {
+  if (millis() - servoTimer < SERVO_UPDATE_INTERVAL)
+    return;
+
+  servoTimer = millis();
+
+  for (int i = 0; i < NUM_FINGERS; i++) {
+    if (currentPos[i] < targetPos[i]) {
+      currentPos[i]++;
+      servos[i].write(currentPos[i]);
+    }
+    else if (currentPos[i] > targetPos[i]) {
+      currentPos[i]--;
+      servos[i].write(currentPos[i]);
+    }
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
   Serial.begin(115200);
   delay(500);
 
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
 
-  // Servos
+  // ====================================================
+  // SERVO SETUP
+  // ====================================================
+  Serial.println("Initializing servos...");
+
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
 
-  for (int i = 0; i < 5; i++) {
-    fingers[i].setPeriodHertz(50);
-    fingers[i].attach(SERVO_PINS[i], 500, 2400);
-    fingers[i].write(SERVO_OPEN);
+  for (int i = 0; i < NUM_FINGERS; i++) {
+    servos[i].setPeriodHertz(50);
+    servos[i].attach(servoPins[i], 500, 2400);
+    servos[i].write(OPEN_ANGLE);
+    delay(50);
   }
-  servoAngle = SERVO_OPEN;
 
-  // Clean muscle state
-  muscleActive  = false;
-  musclePrev    = false;
-  muscleOnTime  = 0;
-  muscleOffTime = millis();
-  handState     = IDLE;
+  Serial.println("Servos initialized.");
 
-  // 1kHz EMG timer
-  emgTimer = timerBegin(0, 80, true);
-  timerAttachInterrupt(emgTimer, &onTimer, true);
-  timerAlarmWrite(emgTimer, 1000, true);
-  timerAlarmEnable(emgTimer);
+  // ====================================================
+  // DRV2605L HAPTIC DRIVER SETUP
+  // ====================================================
+  Serial.println("Initializing haptic driver...");
 
-  Serial.println("=====================================");
-  Serial.println("  5-SERVO GRIP — ESP32               ");
-  Serial.println("=====================================");
-  Serial.printf ("  Threshold : %.4f\n", threshold);
-  Serial.printf ("  Servo range: %d to %d deg\n", SERVO_OPEN, SERVO_CLOSED);
-  Serial.println("  o = force open  t=values");
-  Serial.println("=====================================\n");
-  Serial.println("  Ready! Flex to close, relax to open.");
+  Wire.begin(21, 22);  // SDA=21, SCL=22
+
+  if (!drv.begin()) {
+    Serial.println("ERROR: DRV2605 NOT FOUND!");
+    while (1);
+  }
+
+  drv.useERM();                              // ERM (eccentric rotating mass) motor
+  drv.setMode(DRV2605_MODE_REALTIME);        // Real-time mode for continuous feedback
+
+  delay(500);
+  Serial.println("Haptic driver initialized.");
+
+  // ====================================================
+  // STARTUP MESSAGE
+  // ====================================================
+  delay(500);
+  Serial.println("\n============================================");
+  Serial.println("  ADAPTIVE EMG PROSTHETIC ARM - READY");
+  Serial.println("  5 Fingers | 3 Gestures | Slip Detection");
+  Serial.println("============================================\n");
 }
 
-// ===================================================
-//  LOOP
-// ===================================================
+// ======================================================
+// MAIN LOOP
+// ======================================================
 void loop() {
-  unsigned long now = millis();
 
-  // 1. EMG
-  if (newSample) {
-    portENTER_CRITICAL(&timerMux);
-    int adc   = rawADC;
-    newSample = false;
-    portEXIT_CRITICAL(&timerMux);
-    processEMG(adc);
+  // ====================================================
+  // EMG SIGNAL ACQUISITION & PROCESSING
+  // ====================================================
+  int raw1 = analogRead(emgPin1);
+  int raw2 = analogRead(emgPin2);
+
+  // Full-wave rectification (absolute deviation from baseline)
+  int rect1 = abs(raw1 - BASELINE);
+  int rect2 = abs(raw2 - BASELINE);
+
+  // Exponential moving average for noise reduction
+  smoothedEMG1 = EMA_ALPHA * rect1 + (1.0f - EMA_ALPHA) * smoothedEMG1;
+  smoothedEMG2 = EMA_ALPHA * rect2 + (1.0f - EMA_ALPHA) * smoothedEMG2;
+
+  // ====================================================
+  // GESTURE CLASSIFICATION (based on smoothed EMG)
+  // ====================================================
+
+  // POINT GESTURE: High extensor signal dominates
+  if (smoothedEMG2 > POINT_THRESHOLD && smoothedEMG2 > smoothedEMG1) {
+    currentGesture = GESTURE_POINT;
+    setPointTargets();
   }
 
-  // 2. Muscle
-  updateMuscle();
+  // CLOSE GESTURE: High flexor signal dominates
+  else if (smoothedEMG1 > FLEX_THRESHOLD && smoothedEMG1 > smoothedEMG2) {
+    currentGesture = GESTURE_CLOSE;
 
-  // 3. Hand
-  updateHand();
+    // Map EMG strength to grip angle (proportional grip)
+    int grip = map(smoothedEMG1, FLEX_THRESHOLD, 1800, CLOSE_MIN, CLOSE_MAX);
+    grip = constrain(grip, CLOSE_MIN, CLOSE_MAX);
 
-  // 4. Commands
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    if (cmd == 'o') {
-      handState  = OPENING;
-      Serial.println(">> Force open");
+    setAllTargets(grip);
+  }
+
+  // OPEN GESTURE: Both signals below threshold
+  else if (smoothedEMG1 < RELAX_THRESHOLD && smoothedEMG2 < RELAX_THRESHOLD) {
+    currentGesture = GESTURE_OPEN;
+    setAllTargets(OPEN_ANGLE);
+    objectDetected = false;
+  }
+
+  // ====================================================
+  // SMOOTH SERVO UPDATE
+  // ====================================================
+  updateServos();
+
+  // ====================================================
+  // FSR READING (averaged over 10 samples)
+  // ====================================================
+  int total = 0;
+  for (int i = 0; i < 10; i++) {
+    total += analogRead(fsrPin);
+    delayMicroseconds(300);
+  }
+  fsrValue = total / 10;
+
+  // ====================================================
+  // REAL-TIME HAPTIC FEEDBACK (proportional to FSR)
+  // ====================================================
+  int vibration = map(fsrValue, 0, 4095, 0, 127);
+  vibration = constrain(vibration, 0, 127);
+
+  // Filter out noise (dead zone)
+  if (vibration < 10)
+    vibration = 0;
+
+  vibrateRealtime(vibration);
+
+  // ====================================================
+  // ADAPTIVE GRIP WITH SLIP DETECTION
+  // ====================================================
+  if (currentGesture == GESTURE_CLOSE) {
+
+    // ================================================
+    // OBJECT DETECTION
+    // ================================================
+    if (!objectDetected && fsrValue > FSR_CONTACT) {
+      objectDetected = true;
+      hapticTouch();
+      Serial.println(">> OBJECT DETECTED");
     }
-    if (cmd == 't') {
-      Serial.printf("RMS:%.4f  Thresh:%.4f  Muscle:%d  Angle:%d  State:%d\n",
-                    rmsValue, threshold, muscleActive,
-                    servoAngle, (int)handState);
+
+    // ================================================
+    // SLIP DETECTION & COMPENSATION
+    // ================================================
+    int fsrDrop = previousFSR - fsrValue;
+
+    if (objectDetected && fsrDrop > FSR_SLIP_THRESH) {
+      // Increase grip on all fingers to prevent slip
+      for (int i = 0; i < NUM_FINGERS; i++) {
+        targetPos[i] += 4;
+        targetPos[i] = constrain(targetPos[i], CLOSE_MIN, CLOSE_MAX);
+      }
+
+      hapticSlip();
+      Serial.println(">> SLIP DETECTED - GRIP INCREASED");
     }
-    // Manual threshold tuning
-    if (cmd == '+') { threshold += 0.005f; Serial.printf("Threshold -> %.4f\n", threshold); }
-    if (cmd == '-') { threshold -= 0.005f; Serial.printf("Threshold -> %.4f\n", threshold); }
+
+    previousFSR = fsrValue;
+
+    // ================================================
+    // OVERPRESSURE PROTECTION
+    // ================================================
+    if (fsrValue > FSR_MAX) {
+      // Decrease grip on all fingers to protect object
+      for (int i = 0; i < NUM_FINGERS; i++) {
+        targetPos[i] -= 2;
+        targetPos[i] = constrain(targetPos[i], CLOSE_MIN, CLOSE_MAX);
+      }
+
+      hapticOverpressure();
+      Serial.println(">> OVERPRESSURE - GRIP REDUCED");
+    }
   }
 
-  // 5. TelePlot @ 50Hz
-  if (now - plotTimer >= 20) {
-    plotTimer = now;
-    Serial.printf(">rms:%.4f\n",       rmsValue);
-    Serial.printf(">threshold:%.4f\n", threshold);
-    Serial.printf(">muscle:%.1f\n",    muscleActive ? 1.0f : 0.0f);
-    Serial.printf(">angle:%.1f\n",     (float)servoAngle);
-    Serial.printf(">state:%.1f\n",     (float)handState);
+  // ====================================================
+  // POINT GESTURE HAPTIC FEEDBACK
+  // ====================================================
+  static Gesture prevGesture = GESTURE_OPEN;
+
+  if (currentGesture == GESTURE_POINT && prevGesture != GESTURE_POINT) {
+    hapticPoint();
   }
+
+  prevGesture = currentGesture;
+
+  // ====================================================
+  // SERIAL DEBUG OUTPUT
+  // ====================================================
+  Serial.printf(">EMG1:%.2f >EMG2:%.2f >FSR:%d >Gesture:%d\n",
+                smoothedEMG1,
+                smoothedEMG2,
+                fsrValue,
+                currentGesture);
+
+  delay(10);
 }
